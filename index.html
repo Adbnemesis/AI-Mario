@@ -1,0 +1,635 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Mario — Long Level Canvas (All features)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>
+  html,body{height:100%;margin:0;background:#74b9ff;font-family:Arial,Helvetica,sans-serif}
+  #wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+  canvas{background:linear-gradient(#87ceeb,#5c94fc);box-shadow:0 6px 24px rgba(0,0,0,0.25)}
+  .overlay { position:fixed; left:12px; top:12px; color:#fff; text-shadow:0 1px 0 rgba(0,0,0,0.6); z-index:20}
+  .hint { position:fixed; right:12px; top:12px; color:#fff; text-shadow:0 1px 0 rgba(0,0,0,0.6); z-index:20}
+  /* Mobile controls */
+  .controls {
+    position:fixed; left:0; right:0; bottom:8px; display:flex; justify-content:center; gap:16px; z-index:30;
+    pointer-events:none;
+  }
+  .controls .pad { pointer-events:auto; display:flex; gap:8px; align-items:center; }
+  .btn {
+    width:64px; height:64px; border-radius:12px; background:rgba(0,0,0,0.32); color:#fff; display:flex;
+    align-items:center; justify-content:center; font-weight:bold; font-size:18px; user-select:none;
+    -webkit-user-select:none; touch-action: none;
+  }
+  .btn.small{ width:48px; height:48px; font-size:16px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1024" height="576"></canvas>
+</div>
+<div class="overlay">Coins: <span id="ui-coins">0</span> · Lives: <span id="ui-lives">3</span></div>
+<div class="hint">← → move · ↑/Space jump · ↓ enter pipe · F shoot (if fire) · B teleport to Bowser · R restart</div>
+
+<!-- Mobile controls -->
+<div class="controls" id="controls" aria-hidden="false">
+  <div class="pad" id="leftPad">
+    <div class="btn" id="leftBtn">◀</div>
+    <div class="btn" id="rightBtn">▶</div>
+  </div>
+  <div class="pad" id="actionPad">
+    <div class="btn small" id="downBtn">↓</div>
+    <div class="btn" id="jumpBtn">⤴</div>
+    <div class="btn small" id="fireBtn">F</div>
+  </div>
+</div>
+
+<script>
+// FINAL updated Mario game file with fixes: Big/Fire visual & sizing, pipe teleport, mobile controls.
+
+// CONFIG
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const GROUND = H - 96;
+const WORLD_WIDTH = 8000;
+let cameraX = 0;
+
+// UI
+const uiCoins = document.getElementById('ui-coins');
+const uiLives = document.getElementById('ui-lives');
+
+// AUDIO helpers
+let audioCtx = null;
+function ensureAudio(){ if(audioCtx) return; try{ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ audioCtx=null; } }
+function beep(freq=600, t=0.08, type='sine', vol=0.12){
+  if(!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.value = vol;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + t);
+}
+function startMusic(){
+  if(!audioCtx) ensureAudio();
+  if(!audioCtx) return;
+  // lightweight loop
+  if(startMusic._started) return;
+  startMusic._started = true;
+  let i = 0;
+  const notes = [440,523,587,659,784,587,523,440];
+  (function loop(){
+    if(!audioCtx) return;
+    const t0 = audioCtx.currentTime + 0.02;
+    for(let j=0;j<4;j++){
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = notes[(i+j)%notes.length];
+      g.gain.value = 0.02;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(t0 + j*0.14);
+      o.stop(t0 + j*0.14 + 0.12);
+    }
+    i = (i+1)%notes.length;
+    setTimeout(loop, 600);
+  })();
+}
+
+// PLAYER
+const PLAYER_BASE = { w:28, h:36 };
+let player = {
+  x: 80, y: GROUND - PLAYER_BASE.h, w:PLAYER_BASE.w, h:PLAYER_BASE.h,
+  vx:0, vy:0, facing:1, onGround:true,
+  big:false, fire:false, starTime:0, lastShot:0,
+  coins:0, lives:3, score:0, respawnX:80,
+  animFrame:0
+};
+
+// WORLD
+let platforms = [];
+let boxes = [];
+let bricks = [];
+let powerups = [];
+let enemies = [];
+let projectiles = [];
+let pipes = [];
+let bowser = null;
+let princess = null;
+
+// PIPE state
+let pipeEntering = false, pipeTimer = 0, pipeReturnPos = null;
+
+// GAME FLAGS
+let showHowTo = true, gameOver=false, win=false;
+
+// INPUT
+const keys = {};
+const edgeDownKeys = {};
+window.addEventListener('keydown', e => {
+  if(!keys[e.key]) edgeDownKeys[e.key] = true;
+  keys[e.key] = true;
+  ensureAudio();
+  if(showHowTo && (e.key === ' ' || e.key === 'Enter')) showHowTo = false;
+  if(e.key === 'b' || e.key === 'B') teleportToBowser();
+  if(e.key === 'r' || e.key === 'R') resetGame();
+  if(e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') tryEnterPipe(); // edge-based
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; edgeDownKeys[e.key] = false; });
+
+// MOBILE BUTTONS wiring
+function bindTouch(id,onDown,onUp){
+  const el = document.getElementById(id);
+  if(!el) return;
+  const pd = (ev)=>{ ev.preventDefault(); onDown(); };
+  const pu = (ev)=>{ ev.preventDefault(); onUp(); };
+  el.addEventListener('touchstart', pd, {passive:false}); el.addEventListener('mousedown', pd);
+  el.addEventListener('touchend', pu); el.addEventListener('mouseup', pu); el.addEventListener('mouseleave', pu);
+}
+bindTouch('leftBtn', ()=>{ keys['ArrowLeft']=true; }, ()=>{ keys['ArrowLeft']=false; });
+bindTouch('rightBtn', ()=>{ keys['ArrowRight']=true; }, ()=>{ keys['ArrowRight']=false; });
+bindTouch('jumpBtn', ()=>{ keys[' '] = true; tryEnterPipe(); setTimeout(()=>keys[' ']=false,150); }, ()=>{ keys[' ']=false; });
+bindTouch('downBtn', ()=>{ tryEnterPipe(); keys['ArrowDown']=true; }, ()=>{ keys['ArrowDown']=false; });
+bindTouch('fireBtn', ()=>{ keys['f']=true; setTimeout(()=>keys['f']=false,150); }, ()=>{ keys['f']=false; });
+
+// UTIL
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+function overlap(a,b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+// BUILD LEVEL
+function buildLevel(){
+  cameraX = 0;
+  player.x = player.respawnX = 80; player.y = GROUND - PLAYER_BASE.h; player.vx = player.vy = 0;
+  player.big = false; player.fire = false; player.starTime = 0; player.w = PLAYER_BASE.w; player.h = PLAYER_BASE.h;
+  player.coins = 0; player.lives = 3; player.score = 0;
+  showHowTo = true; gameOver = false; win = false;
+  platforms = [ {x:0,y:GROUND,w:WORLD_WIDTH,h:H-GROUND} ];
+  boxes = []; bricks = []; powerups = []; enemies = []; projectiles = []; pipes = [];
+  pipeEntering = false; pipeTimer = 0; pipeReturnPos = null;
+
+  // tutorial boxes
+  boxes.push({x:220,y:GROUND-120,w:36,h:36,used:false});
+  boxes.push({x:340,y:GROUND-120,w:36,h:36,used:false});
+  boxes.push({x:460,y:GROUND-120,w:36,h:36,used:false});
+
+  // scattered boxes
+  for(let px=700; px < WORLD_WIDTH - 1200; px += 420){
+    boxes.push({ x: px + Math.floor(Math.random()*160), y: GROUND - (90 + Math.floor(Math.random()*60)), w:36, h:36, used:false });
+    if(Math.random()<0.5) bricks.push({ x: px + 40, y: GROUND - 120, w:36, h:36, broken:false });
+  }
+  // enemies
+  for(let ex=900; ex < WORLD_WIDTH - 1000; ex += 260){
+    const gvx = (Math.random()>0.5?0.7:-0.7)*(1+Math.random()*0.3);
+    enemies.push({x:ex + Math.floor(Math.random()*120), y:GROUND-24, w:28, h:24, vx:gvx, type:'goomba', dead:false});
+    if(Math.random()<0.7){
+      const kvx = (Math.random()>0.5?0.6:-0.6)*(1+Math.random()*0.2);
+      enemies.push({x:ex+160 + Math.floor(Math.random()*120), y:GROUND-30, w:30, h:30, vx:kvx, type:'koopa', dead:false});
+    }
+  }
+  // pipes pair
+  pipes.push({ x:1600, y:GROUND-64, w:56, h:64, pair:0 });
+  pipes.push({ x:5200, y:GROUND-64, w:56, h:64, pair:0 });
+
+  // Bowser & princess
+  bowser = { x: WORLD_WIDTH - 900, y: GROUND - 120, w:120, h:120, hp:6, alive:true, cooldown:0 };
+  princess = { x: bowser.x + 180, y: GROUND - 120, w:32, h:56, rescued:false };
+
+  platforms.push({ x: bowser.x - 160, y: GROUND - 160, w:520, h:12 });
+}
+
+// SPAWN FROM BOX
+function spawnFromBox(box){
+  const r = Math.random();
+  let type;
+  if(r < 0.55) type = 'coin';
+  else if(r < 0.8) type = 'mushroom';
+  else if(r < 0.95) type = 'flower';
+  else type = 'star';
+  powerups.push({ x: box.x + 6, y: box.y - 18, w:18, h:18, type, vy:-4, ttl:600 });
+  box.used = true;
+}
+
+// APPLY POWERUP (centralized to correctly size/position player)
+function applyPowerup(type){
+  if(type === 'coin'){ player.coins++; player.score += 100; beep(1200,0.06); return; }
+  if(type === 'mushroom'){
+    if(!player.big){
+      // make big: increase both w & h and adjust y so player stays on ground
+      const newW = Math.round(PLAYER_BASE.w * 1.5);
+      const newH = Math.round(PLAYER_BASE.h * 1.5);
+      const dh = newH - player.h;
+      player.h = newH; player.w = newW;
+      player.y -= dh; // lift him so feet remain on ground
+      player.big = true;
+    }
+    player.fire = false;
+    beep(660,0.12);
+    return;
+  }
+  if(type === 'flower'){
+    if(!player.big){
+      const newW = Math.round(PLAYER_BASE.w * 1.5);
+      const newH = Math.round(PLAYER_BASE.h * 1.5);
+      const dh = newH - player.h;
+      player.h = newH; player.w = newW;
+      player.y -= dh;
+      player.big = true;
+    }
+    player.fire = true;
+    beep(880,0.12);
+    return;
+  }
+  if(type === 'star'){
+    player.starTime = 8000;
+    beep(1400,0.12);
+    return;
+  }
+}
+
+// PLAYER HIT
+function playerHit(){
+  if(player.starTime > 0) return;
+  if(player.big){
+    // shrink: restore base size and drop to ground
+    player.big = false; player.fire = false;
+    const oldH = player.h;
+    player.w = PLAYER_BASE.w; player.h = PLAYER_BASE.h;
+    player.y += (oldH - player.h);
+    player.starTime = 1000;
+    beep(260,0.12);
+    return;
+  } else {
+    player.lives--;
+    beep(120,0.28);
+    if(player.lives <= 0){ gameOver = true; showHowTo = false; }
+    else { player.x = player.respawnX; player.y = GROUND - player.h; player.vx = player.vy = 0; player.big=false; player.fire=false; player.starTime = 1000; }
+  }
+}
+
+// SHOOT
+function spawnPlayerFire(){
+  if(!player.fire) return;
+  const now = performance.now();
+  if(player.lastShot && now - player.lastShot < 300) return;
+  player.lastShot = now;
+  const dir = player.facing;
+  projectiles.push({ x: player.x + (dir>0? player.w+6 : -6), y: player.y + player.h/2, vx: dir*6, vy:0, r:6, owner:'player', ttl:2000 });
+  beep(900,0.06,'sine',0.12);
+}
+
+// BOWSER fire
+function spawnBowserProjectile(){
+  const sx = bowser.x + 36, sy = bowser.y + 36;
+  const tx = player.x + player.w/2, ty = player.y + player.h/2;
+  const ang = Math.atan2(ty - sy, tx - sx);
+  const speed = 4.4;
+  projectiles.push({ x: sx, y: sy, vx: Math.cos(ang)*speed, vy: Math.sin(ang)*speed - 1.2, r:9, owner:'bowser', ttl:2800 });
+  beep(320,0.08,'sawtooth',0.12);
+}
+
+// TELEPORT debug
+function teleportToBowser(){
+  player.x = Math.max(40, bowser.x - 120);
+  player.y = GROUND - player.h;
+  player.vx = player.vy = 0;
+}
+
+// TRY ENTER PIPE (edge-trigger)
+function tryEnterPipe(){
+  if(pipeEntering) return;
+  // check if player is standing on a pipe top (feet within small tolerance)
+  for(const p of pipes){
+    const feetY = player.y + player.h;
+    const onTop = (feetY >= p.y - 6 && feetY <= p.y + 6);
+    const horiz = (player.x + player.w > p.x + 6 && player.x < p.x + p.w - 6);
+    if(onTop && horiz){
+      // find pair
+      const dest = pipes.find(pp => pp.pair === p.pair && pp !== p);
+      if(dest){
+        // teleport to dest and schedule return
+        pipeEntering = true;
+        pipeTimer = 0;
+        pipeReturnPos = { x: p.x + 8, y: p.y + p.h - player.h - 2 };
+        player.x = dest.x + 8; player.y = dest.y + dest.h - player.h - 2;
+        player.vx = player.vy = 0;
+        beep(520,0.12);
+        return;
+      }
+    }
+  }
+}
+
+// HANDLE RETURN FROM PIPE
+function updatePipeReturn(dt){
+  if(!pipeEntering) return;
+  pipeTimer += dt;
+  if(pipeTimer > 3000){
+    if(pipeReturnPos){
+      player.x = pipeReturnPos.x; player.y = pipeReturnPos.y; player.vx = player.vy = 0;
+    }
+    pipeEntering = false; pipeTimer = 0; pipeReturnPos = null;
+    beep(620,0.08);
+  }
+}
+
+// RESET
+function resetGame(){ buildLevel(); showHowTo=false; gameOver=false; win=false; }
+
+// GAME LOOP
+let last = performance.now();
+function update(ts){
+  const dt = Math.min(40, (ts - last) || 16);
+  last = ts;
+  if(showHowTo || gameOver || win){
+    if(player.starTime > 0) player.starTime = Math.max(0, player.starTime - dt);
+    return;
+  }
+
+  // input horizontal
+  const ACC = player.big ? 0.22 : 0.18;
+  const MAX_VX = player.big ? 4.6 : 3.6;
+  if(keys['ArrowLeft'] || keys['a']) { player.vx = clamp(player.vx - ACC, -MAX_VX, MAX_VX); player.facing = -1; }
+  else if(keys['ArrowRight'] || keys['d']) { player.vx = clamp(player.vx + ACC, -MAX_VX, MAX_VX); player.facing = 1; }
+  else { player.vx *= 0.85; if(Math.abs(player.vx) < 0.05) player.vx = 0; }
+
+  // jump
+  if((keys['ArrowUp'] || keys[' ']) && player.onGround){
+    player.vy = -10.2; player.onGround = false; beep(420,0.08);
+  }
+
+  // shoot
+  if((keys['f'] || keys['F'])) spawnPlayerFire();
+
+  // gravity & move
+  player.vy += 0.6; if(player.vy > 16) player.vy = 16;
+  const prevY = player.y;
+  player.x += player.vx; player.y += player.vy;
+  player.x = clamp(player.x, 0, WORLD_WIDTH - player.w);
+
+  // vertical platform collisions
+  player.onGround = false;
+  for(const plat of platforms){
+    if(player.x + player.w > plat.x && player.x < plat.x + plat.w){
+      if(prevY + player.h <= plat.y && player.y + player.h >= plat.y){
+        player.y = plat.y - player.h; player.vy = 0; player.onGround = true;
+      }
+    }
+  }
+
+  // fell off
+  if(player.y > H + 300){
+    player.lives--; beep(80,0.3);
+    if(player.lives <= 0) gameOver = true;
+    else { player.x = player.respawnX; player.y = GROUND - player.h; player.vx = player.vy = 0; }
+  }
+
+  // head-hit detection
+  if(player.vy < 0){
+    const headRect = { x: player.x + 4, y: player.y, w: player.w - 8, h: 6 };
+    boxes.forEach(b=>{
+      if(!b.used && headRect.x < b.x + b.w && headRect.x + headRect.w > b.x && headRect.y < b.y + b.h && headRect.y + headRect.h > b.y){
+        b.used = true; spawnFromBox(b); beep(880,0.06);
+      }
+    });
+    bricks.forEach(br=>{
+      if(!br.broken && headRect.x < br.x + br.w && headRect.x + headRect.w > br.x && headRect.y < br.y + br.h && headRect.y + headRect.h > br.y){
+        if(player.big){ br.broken = true; beep(200,0.08); }
+        else { player.vy = 1.6; beep(220,0.06); }
+      }
+    });
+  }
+
+  // update powerups
+  for(let i=powerups.length-1;i>=0;i--){
+    const p = powerups[i];
+    p.vy += 0.2; p.y += p.vy;
+    if(p.y + p.h > GROUND){ p.y = GROUND - p.h; p.vy = 0; }
+    if(overlap(player,p)){
+      applyPowerup(p.type);
+      powerups.splice(i,1);
+      continue;
+    }
+    p.ttl -= 1;
+    if(p.ttl <= 0) powerups.splice(i,1);
+  }
+
+  // enemies
+  for(const e of enemies){
+    if(e.dead) continue;
+    e.x += e.vx;
+    if(e.x < 0 || e.x + e.w > WORLD_WIDTH) e.vx *= -1;
+    if(overlap(player,e)){
+      if(player.vy > 0 && (player.y + player.h - e.y) < 14){ e.dead = true; player.vy = -7; beep(700,0.06); }
+      else playerHit();
+    }
+  }
+
+  // projectiles
+  for(let i=projectiles.length-1;i>=0;i--){
+    const pr = projectiles[i];
+    if(pr.owner==='bowser') pr.vy += 0.12;
+    pr.x += pr.vx; pr.y += pr.vy;
+    pr.ttl -= 1;
+    if(pr.owner==='player'){
+      for(const en of enemies){ if(!en.dead && overlap({x:pr.x-pr.r,y:pr.y-pr.r,w:pr.r*2,h:pr.r*2}, en)){ en.dead = true; pr.ttl=-1; beep(420,0.06); break; } }
+      if(bowser && bowser.alive && overlap({x:pr.x-pr.r,y:pr.y-pr.r,w:pr.r*2,h:pr.r*2}, bowser)){ bowser.hp--; pr.ttl=-1; beep(180,0.08); if(bowser.hp<=0){ bowser.alive=false; princess.rescued=true; win=true; } }
+    } else if(pr.owner==='bowser'){
+      if(overlap(player, {x:pr.x-pr.r,y:pr.y-pr.r,w:pr.r*2,h:pr.r*2})){ pr.ttl=-1; playerHit(); }
+    }
+    if(pr.ttl<=0 || pr.x < -200 || pr.x > WORLD_WIDTH+200 || pr.y > H+200) projectiles.splice(i,1);
+  }
+
+  // bowser ai
+  if(bowser && bowser.alive){
+    const dist = Math.abs( (player.x + player.w/2) - (bowser.x + bowser.w/2) );
+    if(dist < 520){
+      bowser.cooldown -= dt;
+      if(bowser.cooldown <= 0){ spawnBowserProjectile(); bowser.cooldown = 950 + Math.random()*800; }
+    } else bowser.cooldown -= dt*0.05;
+  }
+
+  // pipes & return
+  // handlePipes triggers on keys down; tryEnterPipe is called on keydown/map
+  updatePipeReturn(dt);
+
+  // camera
+  cameraX = clamp(player.x - W/3, 0, WORLD_WIDTH - W);
+
+  // UI and star timer
+  uiCoins.textContent = player.coins;
+  uiLives.textContent = player.lives;
+  if(player.starTime > 0) player.starTime = Math.max(0, player.starTime - dt);
+  if(player.lives <= 0) gameOver = true;
+}
+
+// DRAW MARIO (pixel-ish with color states)
+function drawMario(px, py){
+  // colors
+  const hat = player.fire ? '#ff4d4d' : '#d33';
+  const body = player.fire ? '#ff8c00' : '#2b6fb6';
+  const skin = '#f1c27d';
+  const boot = '#3a240f';
+  const button = '#ffd54f';
+  const scale = player.big ? 1.5 : 1.0;
+  const sw = Math.round(16 * scale), sh = Math.round(24 * scale);
+  // Draw simplified pixel Mario using rects scaled
+  // hat
+  ctx.fillStyle = hat; ctx.fillRect(px, py - 8*scale, sw, Math.round(4*scale));
+  // face
+  ctx.fillStyle = skin; ctx.fillRect(px + Math.round(6*scale), py - Math.round(6*scale), Math.round(4*scale), Math.round(4*scale));
+  // body
+  ctx.fillStyle = body; ctx.fillRect(px + Math.round(2*scale), py + Math.round(2*scale), Math.round(12*scale), Math.round(8*scale));
+  // button
+  ctx.fillStyle = button; ctx.fillRect(px + Math.round(6*scale), py + Math.round(4*scale), Math.round(2*scale), Math.round(2*scale));
+  // legs
+  ctx.fillStyle = boot; ctx.fillRect(px + Math.round(2*scale), py + Math.round(12*scale), Math.round(4*scale), Math.round(6*scale));
+  ctx.fillRect(px + Math.round(10*scale), py + Math.round(12*scale), Math.round(4*scale), Math.round(6*scale));
+  // eye
+  ctx.fillStyle = '#000'; ctx.fillRect(px + Math.round(8*scale), py - Math.round(4*scale), Math.round(2*scale), Math.round(2*scale));
+}
+
+// DRAW
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  const undergroundRegion = (cameraX + W/2) > 4800 && (cameraX + W/2) < 5600;
+
+  if(undergroundRegion){
+    ctx.fillStyle = '#132033'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#3b2b22';
+    for(let i=-1;i<20;i++){ const bx = (i*360) - ((cameraX-4800)*0.3 % 360); ctx.fillRect(bx,220,240,40); }
+  } else {
+    ctx.save(); ctx.translate(-cameraX*0.4,0);
+    for(let i=-2;i<12;i++){ ctx.fillStyle = '#4db35c'; ctx.beginPath(); ctx.ellipse(i*520+120, GROUND+40,300,90,0,0,2*Math.PI); ctx.fill(); }
+    ctx.restore();
+  }
+
+  ctx.save(); ctx.translate(-cameraX,0);
+
+  // platforms
+  platforms.forEach(p=>{ ctx.fillStyle='#8B5A2B'; ctx.fillRect(p.x,p.y,p.w,p.h); ctx.fillStyle='#3CB371'; ctx.fillRect(p.x,p.y, p.w,12); });
+
+  // pipes
+  pipes.forEach(p=>{ ctx.fillStyle='#0b8a2b'; ctx.fillRect(p.x,p.y,p.w,p.h); ctx.fillStyle='#0f6e20'; ctx.fillRect(p.x-6,p.y-10,p.w+12,10); });
+
+  // boxes
+  boxes.forEach(b=>{
+    const yoff = b.used?0: (b.bounce||0) * Math.sin(Date.now()/80);
+    ctx.fillStyle = b.used? '#8b5a0c' : '#ffd54f';
+    ctx.fillRect(b.x, b.y + yoff, b.w, b.h);
+    if(!b.used){ ctx.fillStyle='#7b4d0d'; ctx.font='bold 18px Arial'; ctx.textAlign='center'; ctx.fillText('?', b.x + b.w/2, b.y + b.h*0.65 + yoff); }
+  });
+
+  // bricks
+  bricks.forEach(br=>{ if(!br.broken){ ctx.fillStyle='#b35a2e'; ctx.fillRect(br.x,br.y,br.w,br.h); ctx.fillStyle='#9a3010'; ctx.fillRect(br.x+4,br.y+4,br.w-8,br.h-8); } });
+
+  // powerups
+  powerups.forEach(p=>{
+    if(p.type==='coin'){ ctx.fillStyle='#ffd700'; ctx.beginPath(); ctx.ellipse(p.x+8,p.y+8,7,7,0,0,2*Math.PI); ctx.fill(); }
+    else if(p.type==='mushroom'){ ctx.fillStyle='#b22222'; ctx.fillRect(p.x,p.y,p.w,p.h); ctx.fillStyle='#fff'; ctx.fillRect(p.x+3,p.y+4,6,4); }
+    else if(p.type==='flower'){ ctx.fillStyle='#fff'; ctx.fillRect(p.x,p.y,p.w,p.h); ctx.fillStyle='#ff6a00'; ctx.fillRect(p.x+3,p.y+2,6,6); }
+    else if(p.type==='star'){ ctx.fillStyle='#ffd54f'; ctx.beginPath(); const cx=p.x+8, cy=p.y+8; ctx.moveTo(cx,cy-8); for(let i=1;i<5;i++){const a=(Math.PI*2/5)*i - Math.PI/2; ctx.lineTo(cx+Math.cos(a)*8, cy+Math.sin(a)*8);} ctx.fill(); }
+  });
+
+  // enemies
+  enemies.forEach(e=>{
+    if(e.dead){ ctx.fillStyle='rgba(200,200,200,0.6)'; ctx.fillRect(e.x,e.y,e.w,e.h); }
+    else { ctx.fillStyle = e.type==='koopa' ? '#2e8b57' : '#8B4513'; ctx.fillRect(e.x,e.y,e.w,e.h); ctx.fillStyle='#000'; ctx.fillRect(e.x+6,e.y+6,4,4); }
+  });
+
+  // bowser
+  if(bowser && bowser.alive){
+    ctx.fillStyle='#8b3d1f'; ctx.fillRect(bowser.x,bowser.y,bowser.w,bowser.h);
+    ctx.fillStyle='#fff'; ctx.fillRect(bowser.x+18, bowser.y+18, 12, 8);
+    ctx.fillStyle='#000'; ctx.fillRect(bowser.x, bowser.y-10, bowser.w, 8);
+    ctx.fillStyle='#ff4d4d'; ctx.fillRect(bowser.x+2, bowser.y-8, Math.max(0, (bowser.w - 4) * (bowser.hp/6)), 4);
+  } else if(bowser){
+    ctx.fillStyle='#333'; ctx.fillRect(bowser.x,bowser.y,60,80);
+  }
+
+  // princess
+  if(princess){
+    if(!princess.rescued){ ctx.fillStyle='#ff77c7'; ctx.fillRect(princess.x,princess.y,princess.w,princess.h); ctx.fillStyle='#fff'; ctx.fillRect(princess.x+6,princess.y+6,6,8); }
+    else { ctx.fillStyle='#ff77c7'; ctx.fillRect(player.x+36,princess.y,princess.w,princess.h); }
+  }
+
+  // projectiles
+  projectiles.forEach(p=>{ ctx.beginPath(); ctx.fillStyle = p.owner==='bowser' ? '#ff8c00' : '#fff'; ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill(); });
+
+  // draw player shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.12)'; ctx.fillRect(player.x + 4, GROUND + 6, player.w - 8, 6);
+
+  // draw mario sprite (centered to player's top-left coordinate)
+  drawMario(player.x, player.y - 6);
+
+  ctx.restore();
+
+  // UI outside world
+  ctx.fillStyle='#fff'; ctx.font='bold 18px Arial';
+  ctx.fillText('Coins: ' + player.coins, 12, 24);
+  ctx.fillText('Lives: ' + player.lives, 12, 48);
+
+  // overlays
+  if(showHowTo) drawHowTo();
+  else if(gameOver) drawGameOver();
+  else if(win) drawWin();
+}
+
+function drawHowTo(){
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(W/2 - 360, H/2 - 220, 720, 440);
+  ctx.fillStyle='#fff'; ctx.font='22px Arial'; ctx.fillText('How to Play', W/2 - 60, H/2 - 160);
+  ctx.font='16px Arial';
+  const lines = [
+    'Move: Arrow Left/Right or A/D',
+    'Jump: Up / W / Space',
+    'Enter pipe: Down / S (when on top of a pipe). Short underground bonus area.',
+    'Hit ? boxes from below to get coins or power-ups',
+    'If you get the flower you can shoot with F',
+    'Stomp enemies to defeat them; big Mario shrinks on hit, small Mario loses a life',
+    'Bowser is near the castle and throws fireballs when you approach',
+    'Press B to teleport to Bowser (debug)',
+    'Press R to restart at any time',
+    '',
+    'Press Space or Enter to start'
+  ];
+  for(let i=0;i<lines.length;i++) ctx.fillText(lines[i], W/2 - 320, H/2 - 120 + i*28);
+}
+
+function drawGameOver(){
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(W/2-220,H/2-140,440,280);
+  ctx.fillStyle='#fff'; ctx.font='bold 28px Arial'; ctx.fillText('Game Over', W/2 - 70, H/2 - 80);
+  ctx.font='16px Arial'; ctx.fillText('Final Score: ' + player.score + '   Coins: ' + player.coins, W/2 - 140, H/2 - 40);
+  ctx.fillStyle='#ffcc00'; ctx.fillRect(W/2-80,H/2+10,160,40); ctx.fillStyle='#000'; ctx.fillText('Play Again (R)', W/2-35,H/2+36);
+}
+
+function drawWin(){
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(W/2-240,H/2-160,480,320);
+  ctx.fillStyle='#fff'; ctx.font='bold 26px Arial'; ctx.fillText('You rescued the Princess!', W/2 - 170, H/2 - 80);
+  ctx.font='16px Arial'; ctx.fillText('Coins: ' + player.coins + '  Score: ' + player.score, W/2 - 90, H/2 - 40);
+  ctx.fillStyle='#ffcc00'; ctx.fillRect(W/2-80,H/2+20,160,40); ctx.fillStyle='#000'; ctx.fillText('Play Again (R)', W/2-35,H/2+46);
+}
+
+// MAIN LOOP
+function mainLoop(ts){ update(ts); draw(); requestAnimationFrame(mainLoop); }
+
+// Init
+buildLevel();
+requestAnimationFrame(mainLoop);
+
+// spawn bowser projectile
+function spawnBowserProjectile(){
+  const sx = bowser.x + 40, sy = bowser.y + 30;
+  const tx = player.x + player.w/2, ty = player.y + player.h/2;
+  const ang = Math.atan2(ty - sy, tx - sx);
+  const speed = 4.6;
+  projectiles.push({ x: sx, y: sy, vx: Math.cos(ang)*speed, vy: Math.sin(ang)*speed - 1.2, r:8, owner:'bowser', ttl:3000 });
+  beep(320,0.08,'sawtooth',0.14);
+}
+
+// start audio on interaction
+ensureAudio();
+startMusic();
+window.addEventListener('pointerdown', ()=>{ ensureAudio(); startMusic(); });
+
+</script>
+</body>
+</html>
